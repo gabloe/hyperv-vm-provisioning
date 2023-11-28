@@ -81,6 +81,8 @@ param(
   [bool] $BaseImageCleanup = $true, # delete old vhd image. Set to false if using (TODO) differencing VHD
   [switch] $ShowSerialConsoleWindow = $false,
   [switch] $ShowVmConnectWindow = $false,
+  [string]$RemoteVMHostIPAddress = $null,
+  [PSCredential]$RemoteVMHostCredential = $null,
   [switch] $Force = $false
 )
 
@@ -115,10 +117,17 @@ $verbose = $VerbosePreference -ne 'SilentlyContinue'
 # check if running hyper-v host version 8.0 or later
 # Get-VMHostSupportedVersion https://docs.microsoft.com/en-us/powershell/module/hyper-v/get-vmhostsupportedversion?view=win10-ps
 # or use vmms version: $vmms = Get-Command vmms.exe , $vmms.version. src: https://social.technet.microsoft.com/Forums/en-US/dce2a4ec-10de-4eba-a19d-ae5213a2382d/how-to-tell-version-of-hyperv-installed?forum=winserverhyperv
-$vmms = Get-Command vmms.exe
+$vmms = Get-Command vmms.exe                               ############################### Should this be on the host or dvm?
 if (([System.Version]$vmms.fileversioninfo.productversion).Major -lt 10) {
   throw "Unsupported Hyper-V version. Minimum supported version for is Hyper-V 2016."
 }
+
+$vmRemoteHostSession = $null
+if(-not [System.String]::IsNullOrEmpty($RemoteVMHostIPAddress))
+{
+  $vmRemoteHostSession = New-CimSession -ComputerName $RemoteVMHostIPAddress -Credential $RemoteVMHostCredential -Authentication CredSsp 
+}
+
 
 # Helper function for no error file cleanup
 function cleanupFile ([string]$file) {
@@ -132,7 +141,7 @@ $FQDN = $VMHostname.ToLower() + "." + $DomainName.ToLower()
 # src: https://stackoverflow.com/a/67077483/1155121
 # $vmMachineId = [Guid]::NewGuid().ToString()
 $VmMachineId = "{0:####-####-####-####}-{1:####-####-##}" -f (Get-Random -Minimum 1000000000000000 -Maximum 9999999999999999),(Get-Random -Minimum 1000000000 -Maximum 9999999999)
-$tempPath = [System.IO.Path]::GetTempPath() + $vmMachineId
+$tempPath = [System.IO.Path]::GetTempPath() + $vmMachineId   ############################### Check this
 mkdir -Path $tempPath | out-null
 Write-Verbose "Using temp path: $tempPath"
 
@@ -323,9 +332,21 @@ if ([string]::IsNullOrEmpty($VMStoragePath)) {
 if (!(test-path $VMStoragePath)) {mkdir -Path $VMStoragePath | out-null}
 
 # Delete the VM if it is around
-$vm = Get-VM -VMName $VMName -ErrorAction 'SilentlyContinue'
-if ($vm) {
-  & .\Cleanup-VM.ps1 $VMName -Force:$Force
+if ($vmRemoteHostSession) {
+  Write-Verbose "Found session, connecting to find existing VMs..."
+  # Use the CimSession with Get-VM
+  $vm = Get-VM -VMName $VMName -CimSession $vmRemoteHostSession -ErrorAction 'SilentlyContinue'
+  if ($vm) {
+    Write-Verbose "Found instances of $VMName, cleaning them up..."
+    & .\Cleanup-VM.ps1 $VMName -RemoteServerIP $RemoteVMHostIPAddress -Credential $RemoteVMHostCredential -Force:$Force
+  }
+} else {
+  Write-Verbose "Checking for VMs from local vm host..."
+  # Use Get-VM without CimSession
+  $vm = Get-VM -VMName $VMName -ErrorAction 'SilentlyContinue'
+  if ($vm) {
+    & .\Cleanup-VM.ps1 $VMName -Force:$Force
+  }
 }
 
 # There is a documentation failure not mention needed dsmode setting:
@@ -980,38 +1001,70 @@ try {
 }
 
 # Create new virtual machine and start it
+Write-Host "Disk Path: $VMMachine_StoragePath\$VMName"
+
+if($vmRemoteHostSession) {
+  $FilesAndFolders = gci "$VMMachine_StoragePath\$VMName" -recurse | % {$_.FullName}
+
+  foreach($FileAndFolder in $FilesAndFolders)
+  {
+      #using get-item instead because some of the folders have '[' or ']' character and Powershell throws exception trying to do a get-acl or set-acl on them.    
+      $item = gi -literalpath $FileAndFolder 
+      $acl = $item.GetAccessControl() 
+      $permission = "Everyone","FullControl","Allow"    
+      $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($permission)    
+      $acl.SetAccessRule($rule)
+      $item.SetAccessControl($acl)
+  }
+}
+
+# Common parameters to handle sessions
+$sessionParam = @{}
+if ($vmRemoteHostSession) {
+  $sessionParam['ComputerName'] = $RemoteVMHostIPAddress
+  $sessionParam['Credential'] = $RemoteVMHostCredential
+}
+
 Write-Host "Create VM..." -NoNewline
+
 $vm = new-vm -Name $VMName -MemoryStartupBytes $VMMemoryStartupBytes `
-               -Path "$VMMachinePath" `
-               -VHDPath "$VMDiskPath" -Generation $VMGeneration `
-               -BootDevice VHD -Version $VMVersion | out-null
-Set-VMProcessor -VMName $VMName -Count $VMProcessorCount
+              -Path "$VMMachinePath" `
+              -VHDPath "$VMDiskPath" -Generation $VMGeneration `
+              -BootDevice VHD -Version $VMVersion -Verbose @sessionParam
+Set-VMProcessor -VMName $VMName -Count $VMProcessorCount @sessionParam
 If ($VMDynamicMemoryEnabled) {
-  Set-VMMemory -VMName $VMName -DynamicMemoryEnabled $VMDynamicMemoryEnabled -MaximumBytes $VMMaximumBytes -MinimumBytes $VMMinimumBytes
+  Set-VMMemory -VMName $VMName -DynamicMemoryEnabled $VMDynamicMemoryEnabled -MaximumBytes $VMMaximumBytes -MinimumBytes $VMMinimumBytes @sessionParam
 } else {
-  Set-VMMemory -VMName $VMName -DynamicMemoryEnabled $VMDynamicMemoryEnabled
+  Set-VMMemory -VMName $VMName -DynamicMemoryEnabled $VMDynamicMemoryEnabled @sessionParam
 }
+
 # make sure VM has DVD drive needed for provisioning
-if ($null -eq (Get-VMDvdDrive -VMName $VMName)) {
-  Add-VMDvdDrive -VMName $VMName
+if ($null -eq (Get-VMDvdDrive -VMName $VMName @sessionParam )) {
+  Add-VMDvdDrive -VMName $VMName @sessionParam
 }
-Set-VMDvdDrive -VMName $VMName -Path "$metaDataIso"
+Set-VMDvdDrive -VMName $VMName -Path "$metaDataIso" @sessionParam
 
 If (($null -ne $virtualSwitchName) -and ($virtualSwitchName -ne "")) {
   Write-Verbose "Connecting VMnet adapter to virtual switch '$virtualSwitchName'..."
 } else {
   Write-Warning "No Virtual network switch given."
-  $SwitchList = Get-VMSwitch | Select-Object Name
+  $SwitchList = Get-VMSwitch @sessionParam| Select-Object Name
   If ($SwitchList.Count -eq 1 ) {
     Write-Warning "Using single Virtual switch found: '$($SwitchList.Name)'"
     $virtualSwitchName = $SwitchList.Name
-  } elseif (Get-VMSwitch | Select-Object Name | Select-String "Default Switch") {
+  } elseif (Get-VMSwitch @sessionParam | Select-Object Name | Select-String "Default Switch") {
     Write-Warning "Multiple Switches found; using found 'Default Switch'"
     $virtualSwitchName = "Default Switch"
   }
 }
 If (($null -ne $virtualSwitchName) -and ($virtualSwitchName -ne "")) {
-  Get-VMNetworkAdapter -VMName $VMName | Connect-VMNetworkAdapter -SwitchName "$virtualSwitchName"
+  $vmAdapters = Get-VMNetworkAdapter -VMName $VMName @sessionParam
+  Write-Host "Connecting $vmAdapter to $virtualSwitchName"
+  foreach($adapter in $vmAdapters)
+  {
+    Write-Host "Connecting $($adapter.Name) to $virtualSwitchName"
+    Connect-VMNetworkAdapter -VMName $VMName -Name $adapter.Name -SwitchName $virtualSwitchName @sessionParam
+  }
 } else {
   Write-Warning "No Virtual network switch given and could not automatically selected."
   Write-Warning "Please use parameter -virtualSwitchName 'Switch Name'."
@@ -1020,12 +1073,12 @@ If (($null -ne $virtualSwitchName) -and ($virtualSwitchName -ne "")) {
 
 if (($null -ne $VMStaticMacAddress) -and ($VMStaticMacAddress -ne "")) {
   Write-Verbose "Setting static MAC address '$VMStaticMacAddress' on VMnet adapter..."
-  Set-VMNetworkAdapter -VMName $VMName -StaticMacAddress $VMStaticMacAddress
+  Set-VMNetworkAdapter -VMName $VMName -StaticMacAddress $VMStaticMacAddress @sessionParam
 } else {
   Write-Verbose "Using default dynamic MAC address asignment."
 }
 
-$VMNetworkAdapter = Get-VMNetworkAdapter -VMName $VMName
+$VMNetworkAdapter = Get-VMNetworkAdapter -VMName $VMName @sessionParam
 $VMNetworkAdapterName = $VMNetworkAdapter.Name
 If ((($null -ne $VMVlanID) -and ([int]($VMVlanID) -ne 0)) -or
    ((($null -ne $VMNativeVlanID) -and ([int]($VMNativeVlanID) -ne 0)) -and
@@ -1035,43 +1088,43 @@ If ((($null -ne $VMVlanID) -and ([int]($VMVlanID) -ne 0)) -or
     Write-Host "Setting native Vlan ID $VMNativeVlanID with trunk Vlan IDs '$VMAllowedVlanIDList'"
     Write-Host "on virtual network adapter '$VMNetworkAdapterName'..."
     Set-VMNetworkAdapterVlan -VMName $VMName -VMNetworkAdapterName "$VMNetworkAdapterName" `
-                -Trunk  -NativeVlanID $VMNativeVlanID -AllowedVlanIDList $VMAllowedVlanIDList
+                -Trunk  -NativeVlanID $VMNativeVlanID -AllowedVlanIDList $VMAllowedVlanIDList @sessionParam
   } else {
     Write-Host "Setting Vlan ID $VMVlanID on virtual network adapter '$VMNetworkAdapterName'..."
     Set-VMNetworkAdapterVlan -VMName $VMName -VMNetworkAdapterName "$VMNetworkAdapterName" `
-                -Access -VlanId $VMVlanID
+                -Access -VlanId $VMVlanID @sessionParam
   }
 } else {
-  Write-Verbose "Let virtual network adapter '$VMNetworkAdapterName' untagged."
+  Write-Verbose "Left virtual network adapter '$VMNetworkAdapterName' untagged."
 }
 
 if ($VMVMQ) {
     Write-Host "Enable Virtual Machine Queue (100)... " -NoNewline
-    Set-VMNetworkAdapter -VMName $VMName -VmqWeight 100
+    Set-VMNetworkAdapter -VMName $VMName -VmqWeight 100 @sessionParam
     Write-Host -ForegroundColor Green " Done."
 }
 
 if ($VMDhcpGuard) {
     Write-Host "Enable DHCP Guard... " -NoNewline
-    Set-VMNetworkAdapter -VMName $VMName -DhcpGuard On
+    Set-VMNetworkAdapter -VMName $VMName -DhcpGuard On @sessionParam
     Write-Host -ForegroundColor Green " Done."
 }
 
 if ($VMRouterGuard) {
     Write-Host "Enable Router Guard... " -NoNewline
-    Set-VMNetworkAdapter -VMName $VMName -RouterGuard On
+    Set-VMNetworkAdapter -VMName $VMName -RouterGuard On @sessionParam
     Write-Host -ForegroundColor Green " Done."
 }
 
 if ($VMAllowTeaming) {
     Write-Host "Enable Allow Teaming... " -NoNewline
-    Set-VMNetworkAdapter -VMName $VMName -AllowTeaming On
+    Set-VMNetworkAdapter -VMName $VMName -AllowTeaming On @sessionParam
     Write-Host -ForegroundColor Green " Done."
 }
 
 if ($VMPassthru) {
     Write-Host "Enable Passthru... " -NoNewline
-    Set-VMNetworkAdapter -VMName $VMName -Passthru
+    Set-VMNetworkAdapter -VMName $VMName -Passthru @sessionParam
     Write-Host -ForegroundColor Green " Done."
 }
 
@@ -1095,14 +1148,14 @@ if ($VMPassthru) {
 
 if ($VMMacAddressSpoofing) {
   Write-Verbose "Enable MAC address Spoofing on VMnet adapter..."
-  Set-VMNetworkAdapter -VMName $VMName -MacAddressSpoofing On
+  Set-VMNetworkAdapter -VMName $VMName -MacAddressSpoofing On @sessionParam
 } else {
   Write-Verbose "Using default dynamic MAC address asignment."
 }
 
 if ($VMExposeVirtualizationExtensions) {
   Write-Host "Expose Virtualization Extensions to Guest ..."
-  Set-VMProcessor -VMName $VMName -ExposeVirtualizationExtensions $true
+  Set-VMProcessor -VMName $VMName -ExposeVirtualizationExtensions $true @sessionParam
   Write-Host -ForegroundColor Green " Done."
 }
 
@@ -1110,12 +1163,12 @@ if ($VMExposeVirtualizationExtensions) {
 if ($VMGeneration -eq 2) {
   Write-Verbose "Setting secureboot for Hyper-V Gen2..."
   # configure secure boot, src: https://www.altaro.com/hyper-v/hyper-v-2016-support-linux-secure-boot/
-  Set-VMFirmware -VMName $VMName -EnableSecureBoot On -SecureBootTemplateId ([guid]'272e7447-90a4-4563-a4b9-8e4ab00526ce')
+  Set-VMFirmware -VMName $VMName -EnableSecureBoot On -SecureBootTemplateId ([guid]'272e7447-90a4-4563-a4b9-8e4ab00526ce') @sessionParam
 
-  if ($(Get-VMHost).EnableEnhancedSessionMode -eq $true) {
+  if ($(Get-VMHost @sessionParam).EnableEnhancedSessionMode -eq $true) {
     # Ubuntu 18.04+ supports enhanced session and so Debian 10/11
     Write-Verbose "Enable enhanced session mode..."
-    Set-VM -VMName $VMName -EnhancedSessionTransportType HvSocket
+    Set-VM -VMName $VMName -EnhancedSessionTransportType HvSocket @sessionParam
   } else {
     Write-Verbose "Enhanced session mode not enabled because host has not activated support for it."
   }
@@ -1125,17 +1178,31 @@ if ($VMGeneration -eq 2) {
   # PS> Enable-VMIntegrationService -VMName $VMName -Name "Guest Service Interface"
   # PS> Enable-VMIntegrationService -VMName $VMName -Name "Gastdienstschnittstelle"
   # https://administrator.de/forum/hyper-v-cmdlet-powershell-sprachproblem-318175.html
-  Get-VMIntegrationService -VMName $VMName `
-            | Where-Object {$_.Name -match 'Gastdienstschnittstelle|Guest Service Interface'} `
-            | Enable-VMIntegrationService
+  $integrationServices = Get-VMIntegrationService -VMName $VMName @sessionParam | 
+    Where-Object {$_.Name -match 'Gastdienstschnittstelle|Guest Service Interface'}
+
+  foreach ($service in $integrationServices) {
+      Enable-VMIntegrationService -VMName $VMName -Name $service.Name @sessionParam
+  }
 }
 
 # disable automatic checkpoints, https://github.com/hashicorp/vagrant/issues/10251#issuecomment-425734374
-if ($null -ne (Get-Command Hyper-V\Set-VM).Parameters["AutomaticCheckpointsEnabled"]){
-  Hyper-V\Set-VM -VMName $VMName -AutomaticCheckpointsEnabled $false
-}
+if($vmRemoteHostSession)
+{
+  $psSession = New-PSSession -ComputerName $RemoteVMHostIPAddress -Credential $RemoteVMHostCredential 
+  Invoke-Command -Session $psSession -ScriptBlock {
+    if ($null -ne (Get-Command Hyper-V\Set-VM).Parameters["AutomaticCheckpointsEnabled"]) {
+        Hyper-V\Set-VM -VMName $using:VMName -AutomaticCheckpointsEnabled $false
+    }
+  }
 
-Write-Host -ForegroundColor Green " Done."
+  Remove-PSSession $psSession
+}
+else {
+  if ($null -ne (Get-Command Hyper-V\Set-VM).Parameters["AutomaticCheckpointsEnabled"]){
+    Hyper-V\Set-VM -VMName $VMName -AutomaticCheckpointsEnabled $false
+  }
+}
 
 # https://social.technet.microsoft.com/Forums/en-US/d285d517-6430-49ba-b953-70ae8f3dce98/guest-asset-tag?forum=winserverhyperv
 Write-Host "Set SMBIOS serial number ..."
@@ -1144,22 +1211,27 @@ if ($ImageTypeAzure) {
   # set chassis asset tag to Azure constant as documented in https://github.com/canonical/cloud-init/blob/5e6ecc615318b48e2b14c2fd1f78571522848b4e/cloudinit/sources/helpers/azure.py#L1082
   Write-Host "Set Azure chasis asset tag ..." -NoNewline
   # https://social.technet.microsoft.com/Forums/en-US/d285d517-6430-49ba-b953-70ae8f3dce98/guest-asset-tag?forum=winserverhyperv
-  & .\Set-VMAdvancedSettings.ps1 -VM $VMName -ChassisAssetTag '7783-7084-3265-9085-8269-3286-77' -Force -Verbose:$verbose
+  & .\Set-VMAdvancedSettings.ps1 -VM $VMName -ComputerName $RemoteVMHostIPAddress -RemoteCredential $RemoteVMHostCredential -ChassisAssetTag '7783-7084-3265-9085-8269-3286-77' -Force -Verbose:$verbose
   Write-Host -ForegroundColor Green " Done."
 
   # also try to enable NoCloud via SMBIOS  https://cloudinit.readthedocs.io/en/22.4.2/topics/datasources/nocloud.html
   $vmserial_smbios = 'ds=nocloud'
 }
 Write-Host "SMBIOS SN: $vmserial_smbios"
-& .\Set-VMAdvancedSettings.ps1 -VM $VMName -BIOSSerialNumber $vmserial_smbios -ChassisSerialNumber $vmserial_smbios -Force -Verbose:$verbose
+& .\Set-VMAdvancedSettings.ps1 -VM $VMName -ComputerName $RemoteVMHostIPAddress -RemoteCredential $RemoteVMHostCredential -BIOSSerialNumber $vmserial_smbios -ChassisSerialNumber $vmserial_smbios -Force -Verbose:$verbose
 Write-Host -ForegroundColor Green " Done."
 
 # redirect com port to pipe for VM serial output, src: https://superuser.com/a/1276263/145585
-Set-VMComPort -VMName $VMName -Path \\.\pipe\$VMName-com1 -Number 1
+Set-VMComPort -VMName $VMName -Path \\.\pipe\$VMName-com1 -Number 1 @sessionParam
 Write-Verbose "Serial connection: \\.\pipe\$VMName-com1"
 
 # enable guest integration services (could be used for Copy-VMFile)
-Get-VMIntegrationService -VMName $VMName | Where-Object Name -match 'guest' | Enable-VMIntegrationService
+$integrationServices = Get-VMIntegrationService -VMName $VMName @sessionParam | 
+    Where-Object {$_.Name -match 'guest'}
+
+foreach ($service in $integrationServices) {
+    Enable-VMIntegrationService -VMName $VMName -Name $service.Name @sessionParam
+}
 
 # Clean up temp directory
 Remove-Item -Path $tempPath -Recurse -Force
@@ -1168,34 +1240,53 @@ Remove-Item -Path $tempPath -Recurse -Force
 if ($PSBoundParameters.Debug -eq $true) {
   # make VM snapshot before 1st run
   Write-Host "Creating checkpoint..." -NoNewline
-  Checkpoint-VM -Name $VMName -SnapshotName Initial
+  Checkpoint-VM -Name $VMName -SnapshotName Initial @sessionParam
   Write-Host -ForegroundColor Green " Done."
 }
 
+Start-Sleep -Seconds 90
+
+Write-Host "Virtual Machine Path: $VMMachine_StoragePath\$VMName"
+
+if($vmRemoteHostSession) {
+  $FilesAndFolders = gci "$VMMachine_StoragePath\$VMName" -recurse | % {$_.FullName}
+
+  foreach($FileAndFolder in $FilesAndFolders)
+  {
+    Write-Host "Changing Permissions on $FileAndFolder"
+    #using get-item instead because some of the folders have '[' or ']' character and Powershell throws exception trying to do a get-acl or set-acl on them.    
+    $item = gi -literalpath $FileAndFolder 
+    $acl = $item.GetAccessControl() 
+    $permission = "Everyone","FullControl","Allow"    
+    $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($permission)    
+    $acl.SetAccessRule($rule)
+    $item.SetAccessControl($acl)
+  }
+}
+
 Write-Host "Starting VM..." -NoNewline
-Start-VM $VMName
+Start-VM -VMName $VMName @sessionParam
 Write-Host -ForegroundColor Green " Done."
 
 # TODO check if VM has got an IP ADDR, if address is missing then write error because provisioning won't work without IP, src: https://stackoverflow.com/a/27999072/1155121
 
+# if ($ShowSerialConsoleWindow) {
+#   # start putty or hvc.exe with serial connection to newly created VM
+#   try {
+#     Get-Command "putty" | out-null
+#     start-sleep -seconds 2
+#     & "PuTTY" -serial "\\.\pipe\$VMName-com1" -sercfg "115200,8,n,1,N"
+#   }
+#   catch {
+#     Write-Verbose "putty not available, will try Windows Terminal + hvc.exe"
+#     Start-Process "wt.exe" "new-tab cmd /k hvc.exe serial $VMName" -WindowStyle Normal
+#   }
 
-if ($ShowSerialConsoleWindow) {
-  # start putty or hvc.exe with serial connection to newly created VM
-  try {
-    Get-Command "putty" | out-null
-    start-sleep -seconds 2
-    & "PuTTY" -serial "\\.\pipe\$VMName-com1" -sercfg "115200,8,n,1,N"
-  }
-  catch {
-    Write-Verbose "putty not available, will try Windows Terminal + hvc.exe"
-    Start-Process "wt.exe" "new-tab cmd /k hvc.exe serial $VMName" -WindowStyle Normal
-  }
+# }
 
-}
+# if ($ShowVmConnectWindow) {
+#   # Open up VMConnect
+#   Start-Process "vmconnect" "localhost","$VMName" -WindowStyle Normal
+# }
 
-if ($ShowVmConnectWindow) {
-  # Open up VMConnect
-  Start-Process "vmconnect" "localhost","$VMName" -WindowStyle Normal
-}
-
-Write-Host "Done"
+Write-Host -ForegroundColor Green " Done."

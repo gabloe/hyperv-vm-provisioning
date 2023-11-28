@@ -94,6 +94,7 @@
 	(
 		[Parameter(Mandatory=$true, ValueFromPipeline=$true, Position=1)][PSObject]$VM,
 		[Parameter()][String]$ComputerName = $env:COMPUTERNAME,
+		[Parameter()][PSCredential]$RemoteCredential = $null,
 		[Parameter(ParameterSetName='ManualBIOSGUID')][Object]$NewBIOSGUID,
 		[Parameter(ParameterSetName='AutoBIOSGUID')][Switch]$AutoGenBIOSGUID,
 		[Parameter()][String]$BaseBoardSerialNumber,
@@ -231,14 +232,21 @@
 			}
 		}
 
+		$credential = @{}
+
+		if($RemoteCredential)
+		{
+			$credential['Credential'] = $RemoteCredential
+		}
+
 		Write-Verbose -Message ('Establishing WMI connection to Virtual Machine Management Service on {0}...' -f $ComputerName)
-		$VMMS = Get-WmiObject -ComputerName $ComputerName -Namespace 'root\virtualization\v2' -Class 'Msvm_VirtualSystemManagementService' -ErrorAction Stop
+		$VMMS = Get-WmiObject -ComputerName $ComputerName -Namespace 'root\virtualization\v2' -Class 'Msvm_VirtualSystemManagementService' -ErrorAction Stop @credential
 		Write-Verbose -Message 'Acquiring an empty parameter object for the ModifySystemSettings function...'
 		$ModifySystemSettingsParams = $VMMS.GetMethodParameters('ModifySystemSettings')
 		Write-Verbose -Message ('Establishing WMI connection to virtual machine {0}' -f $VMName)
 		if($VMObject -eq $null)
 		{
-			$VMObject = Get-WmiObject -ComputerName $ComputerName -Namespace 'root\virtualization\v2' -Class 'Msvm_ComputerSystem' -Filter ('ElementName = "{0}"' -f $VMName) -ErrorAction Stop
+			$VMObject = Get-WmiObject -ComputerName $ComputerName -Namespace 'root\virtualization\v2' -Class 'Msvm_ComputerSystem' -Filter ('ElementName = "{0}"' -f $VMName) -ErrorAction Stop @credential
 		}
 		if($VMObject -eq $null)
 		{

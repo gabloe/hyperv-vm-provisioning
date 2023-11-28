@@ -1211,14 +1211,14 @@ if ($ImageTypeAzure) {
   # set chassis asset tag to Azure constant as documented in https://github.com/canonical/cloud-init/blob/5e6ecc615318b48e2b14c2fd1f78571522848b4e/cloudinit/sources/helpers/azure.py#L1082
   Write-Host "Set Azure chasis asset tag ..." -NoNewline
   # https://social.technet.microsoft.com/Forums/en-US/d285d517-6430-49ba-b953-70ae8f3dce98/guest-asset-tag?forum=winserverhyperv
-  & .\Set-VMAdvancedSettings.ps1 -VM $VMName -ComputerName $RemoteVMHostIPAddress -RemoteCredential $RemoteVMHostCredential -ChassisAssetTag '7783-7084-3265-9085-8269-3286-77' -Force -Verbose:$verbose
+  & .\Set-VMAdvancedSettings.ps1 -VM $VMName -ChassisAssetTag '7783-7084-3265-9085-8269-3286-77' -Force -Verbose:$verbose @sessionParam
   Write-Host -ForegroundColor Green " Done."
 
   # also try to enable NoCloud via SMBIOS  https://cloudinit.readthedocs.io/en/22.4.2/topics/datasources/nocloud.html
   $vmserial_smbios = 'ds=nocloud'
 }
 Write-Host "SMBIOS SN: $vmserial_smbios"
-& .\Set-VMAdvancedSettings.ps1 -VM $VMName -ComputerName $RemoteVMHostIPAddress -RemoteCredential $RemoteVMHostCredential -BIOSSerialNumber $vmserial_smbios -ChassisSerialNumber $vmserial_smbios -Force -Verbose:$verbose
+& .\Set-VMAdvancedSettings.ps1 -VM $VMName -BIOSSerialNumber $vmserial_smbios -ChassisSerialNumber $vmserial_smbios -Force -Verbose:$verbose @sessionParam
 Write-Host -ForegroundColor Green " Done."
 
 # redirect com port to pipe for VM serial output, src: https://superuser.com/a/1276263/145585

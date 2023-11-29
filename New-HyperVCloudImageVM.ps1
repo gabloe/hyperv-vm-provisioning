@@ -862,7 +862,8 @@ if (!(test-path "$($ImageCachePath)\$($ImageOS)-$($stamp).$($ImageFileExtension)
       Write-Verbose $(Get-Date)
       $ProgressPreference = "SilentlyContinue" #Disable progress indicator because it is causing Invoke-WebRequest to be very slow
       # download new image
-      Invoke-WebRequest "$($ImagePath).$($ImageFileExtension)" -OutFile "$($ImageCachePath)\$($ImageOS)-$($stamp).$($ImageFileExtension).tmp" -UseBasicParsing
+      $tempFile = "$($ImageCachePath)\$($ImageOS)-$($stamp).$($ImageFileExtension).tmp"
+      Invoke-WebRequest "$($ImagePath).$($ImageFileExtension)" -OutFile $tempFile -UseBasicParsing
       $ProgressPreference = "Continue" #Restore progress indicator.
       if ((Get-Item $tempFile).Length -ne $downloadSize) {
           throw "Incomplete download"
@@ -870,7 +871,7 @@ if (!(test-path "$($ImageCachePath)\$($ImageOS)-$($stamp).$($ImageFileExtension)
 
       # rename from .tmp to $($ImageFileExtension)
       Remove-Item "$($ImageCachePath)\$($ImageOS)-$($stamp).$($ImageFileExtension)" -Force -ErrorAction 'SilentlyContinue'
-      Rename-Item -path "$($ImageCachePath)\$($ImageOS)-$($stamp).$($ImageFileExtension).tmp" `
+      Rename-Item -path $tempFile `
         -newname "$($ImageOS)-$($stamp).$($ImageFileExtension)"
       Write-Host -ForegroundColor Green " Done."
 

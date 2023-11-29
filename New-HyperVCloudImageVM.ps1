@@ -835,54 +835,79 @@ if ($BaseImageCheckForUpdate -or ($stamp -eq '')) {
 
 # check if local cached cloud image is the target one per $stamp
 if (!(test-path "$($ImageCachePath)\$($ImageOS)-$($stamp).$($ImageFileExtension)")) {
-  try {
-    # If we do not have a matching image - delete the old ones and download the new one
-    Write-Verbose "Did not find: $($ImageCachePath)\$($ImageOS)-$($stamp).$($ImageFileExtension)"
-    Write-Host 'Removing old images from cache...' -NoNewline
-    Remove-Item "$($ImageCachePath)" -Exclude 'baseimagetimestamp.txt',"$($ImageOS)-$($stamp).*" -Recurse -Force
-    Write-Host -ForegroundColor Green " Done."
 
-    # get headers for content length
-    Write-Host 'Check new image size ...' -NoNewline
-    $response = Invoke-WebRequest "$($ImagePath).$($ImageFileExtension)" -UseBasicParsing -Method Head
-    $downloadSize = [int]$response.Headers["Content-Length"]
-    Write-Host -ForegroundColor Green " Done."
+  $maxRetries = 5
+  $retryCount = 0
+  $downloadSuccess = $false
+  $initialDelay = 30 # seconds
+  $delay = $initialDelay
+  $maxDelay = 300 # seconds
+  $multiplier = 2
 
-    Write-Host "Downloading new Cloud image ($([int]($downloadSize / 1024 / 1024)) MB)..." -NoNewline
-    Write-Verbose $(Get-Date)
-    $ProgressPreference = "SilentlyContinue" #Disable progress indicator because it is causing Invoke-WebRequest to be very slow
-    # download new image
-    Invoke-WebRequest "$($ImagePath).$($ImageFileExtension)" -OutFile "$($ImageCachePath)\$($ImageOS)-$($stamp).$($ImageFileExtension).tmp" -UseBasicParsing
-    $ProgressPreference = "Continue" #Restore progress indicator.
-    # rename from .tmp to $($ImageFileExtension)
-    Remove-Item "$($ImageCachePath)\$($ImageOS)-$($stamp).$($ImageFileExtension)" -Force -ErrorAction 'SilentlyContinue'
-    Rename-Item -path "$($ImageCachePath)\$($ImageOS)-$($stamp).$($ImageFileExtension).tmp" `
-      -newname "$($ImageOS)-$($stamp).$($ImageFileExtension)"
-    Write-Host -ForegroundColor Green " Done."
+  while (-not $downloadSuccess -and $retryCount -lt $maxRetries) {
+    try {
+      # If we do not have a matching image - delete the old ones and download the new one
+      Write-Verbose "Did not find: $($ImageCachePath)\$($ImageOS)-$($stamp).$($ImageFileExtension)"
+      Write-Host 'Removing old images from cache...' -NoNewline
+      Remove-Item "$($ImageCachePath)" -Exclude 'baseimagetimestamp.txt',"$($ImageOS)-$($stamp).*" -Recurse -Force
+      Write-Host -ForegroundColor Green " Done."
 
-    # check file hash
-    Write-Host "Checking file hash for downloaded image..." -NoNewline
-    Write-Verbose $(Get-Date)
-    $hashSums = [System.Text.Encoding]::UTF8.GetString((Invoke-WebRequest $ImageHashPath -UseBasicParsing).Content)
-    Switch -Wildcard ($ImageHashPath) {
-      '*SHA256*' {
-        $fileHash = Get-FileHash "$($ImageCachePath)\$($ImageOS)-$($stamp).$($ImageFileExtension)" -Algorithm SHA256
+      # get headers for content length
+      Write-Host 'Check new image size ...' -NoNewline
+      $response = Invoke-WebRequest "$($ImagePath).$($ImageFileExtension)" -UseBasicParsing -Method Head
+      $downloadSize = [int]$response.Headers["Content-Length"]
+      Write-Host -ForegroundColor Green " Done."
+
+      Write-Host "Downloading new Cloud image ($([int]($downloadSize / 1024 / 1024)) MB)..." -NoNewline
+      Write-Verbose $(Get-Date)
+      $ProgressPreference = "SilentlyContinue" #Disable progress indicator because it is causing Invoke-WebRequest to be very slow
+      # download new image
+      Invoke-WebRequest "$($ImagePath).$($ImageFileExtension)" -OutFile "$($ImageCachePath)\$($ImageOS)-$($stamp).$($ImageFileExtension).tmp" -UseBasicParsing
+      $ProgressPreference = "Continue" #Restore progress indicator.
+      if ((Get-Item $tempFile).Length -ne $downloadSize) {
+          throw "Incomplete download"
       }
-      '*SHA512*' {
-        $fileHash = Get-FileHash "$($ImageCachePath)\$($ImageOS)-$($stamp).$($ImageFileExtension)" -Algorithm SHA512
+
+      # rename from .tmp to $($ImageFileExtension)
+      Remove-Item "$($ImageCachePath)\$($ImageOS)-$($stamp).$($ImageFileExtension)" -Force -ErrorAction 'SilentlyContinue'
+      Rename-Item -path "$($ImageCachePath)\$($ImageOS)-$($stamp).$($ImageFileExtension).tmp" `
+        -newname "$($ImageOS)-$($stamp).$($ImageFileExtension)"
+      Write-Host -ForegroundColor Green " Done."
+
+      # check file hash
+      Write-Host "Checking file hash for downloaded image..." -NoNewline
+      Write-Verbose $(Get-Date)
+      $hashSums = [System.Text.Encoding]::UTF8.GetString((Invoke-WebRequest $ImageHashPath -UseBasicParsing).Content)
+      Switch -Wildcard ($ImageHashPath) {
+        '*SHA256*' {
+          $fileHash = Get-FileHash "$($ImageCachePath)\$($ImageOS)-$($stamp).$($ImageFileExtension)" -Algorithm SHA256
+        }
+        '*SHA512*' {
+          $fileHash = Get-FileHash "$($ImageCachePath)\$($ImageOS)-$($stamp).$($ImageFileExtension)" -Algorithm SHA512
+        }
+        default {throw "$ImageHashPath not supported."}
       }
-      default {throw "$ImageHashPath not supported."}
+      if (($hashSums | Select-String -pattern $fileHash.Hash -SimpleMatch).Count -eq 0) {throw "File hash check failed"}
+      Write-Verbose $(Get-Date)
+      Write-Host -ForegroundColor Green " Done."
+      $downloadSuccess = $true
     }
-    if (($hashSums | Select-String -pattern $fileHash.Hash -SimpleMatch).Count -eq 0) {throw "File hash check failed"}
-    Write-Verbose $(Get-Date)
-    Write-Host -ForegroundColor Green " Done."
+    catch {
+      cleanupFile "$($ImageCachePath)\$($ImageOS)-$($stamp).$($ImageFileExtension)"
+      Write-Host "Download attempt $($retryCount + 1) failed, error: $($_.Exception.Message)"
+      Write-Host "Waiting for $delay seconds before retrying..."
+      Start-Sleep -Seconds $delay
 
+      # Update delay for next iteration
+      $delay = [math]::Min($delay * $multiplier, $maxDelay)
+
+      $retryCount++
+    }
   }
-  catch {
-    cleanupFile "$($ImageCachePath)\$($ImageOS)-$($stamp).$($ImageFileExtension)"
-    $ErrorMessage = $_.Exception.Message
-    Write-Host "Error: $ErrorMessage"
-    exit 1
+
+  if (-not $downloadSuccess) {
+      Write-Host "Failed to download file after $maxRetries attempts"
+      exit 1
   }
 }
 
